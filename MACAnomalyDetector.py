@@ -10,7 +10,7 @@ from datetime import datetime
 SETUP_DURATION = 15  # seconds for setup mode
 WHITELIST_FILE = "whitelist.json"
 ALERT_LOG_FILE = "alerts.txt"
-PACKET_LOG_FILE = "packets.csv"
+OBSERVED_PACKET_LOG_FILE = "observed_packets.csv"
 
 # === GLOBAL VARIABLES ===
 whitelist = {}  # MAC -> IP
