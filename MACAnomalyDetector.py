@@ -7,7 +7,7 @@ import threading
 from datetime import datetime
 
 # === CONFIGURATIONS ===
-SETUP_DURATION = 60  # seconds for setup mode
+SETUP_DURATION = 15  # seconds for setup mode
 WHITELIST_FILE = "whitelist.json"
 ALERT_LOG_FILE = "alerts.txt"
 PACKET_LOG_FILE = "packets.csv"
@@ -52,7 +52,7 @@ def setup_mode():
 # === DETECTION MODE ===
 def detection_mode():
     print("\n[DETECTION MODE] Monitoring for anomalies (Press Ctrl + C to stop)...")
-
+    open(ALERT_LOG_FILE, "w").close()
     # Ensure packet log CSV exists with headers
     if not os.path.exists(PACKET_LOG_FILE):
         with open(PACKET_LOG_FILE, "w", newline="") as f:
@@ -84,20 +84,18 @@ def detection_mode():
                 mac_ip_map[src_mac] = src_ip
 
             # Unknown device detection
-            if src_mac not in whitelist and src_mac not in logged_alerts:
+            if src_mac not in whitelist: #and src_mac not in logged_alerts:
                 alert = f"[ALERT - UNKNOWN DEVICE] New MAC detected: {src_mac} ({src_ip}) at {timestamp}"
                 log_alert(alert)
-                logged_alerts.add(src_mac)
 
             # Suspicious vendor detection
             mac_prefix = src_mac.upper()[0:8]
-            if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist and src_mac not in logged_alerts:
+            if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist: #and src_mac not in logged_alerts:
                 alert = f"[ALERT - SUSPICIOUS VENDOR] MAC prefix {mac_prefix} not recognized for {src_mac} ({src_ip}) at {timestamp}"
                 log_alert(alert)
                 logged_alerts.add(src_mac)
 
     sniff(prn=detect, store=0)
-
 
 # === HELPER FUNCTION ===
 log_lock = threading.Lock()
@@ -106,7 +104,6 @@ def log_alert(message):
         print(f"     {message}", flush=True)
         with open(ALERT_LOG_FILE, "a") as f:
             f.write(message + "\n")
-
 
 # === MAIN EXECUTION ===
 if __name__ == "__main__":
