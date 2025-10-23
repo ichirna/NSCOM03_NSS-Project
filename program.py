@@ -1,0 +1,283 @@
+from scapy.all import sniff, ARP, Ether, IP
+import time
+import json
+import csv
+import os
+import threading
+from datetime import datetime
+import ipaddress
+
+# === CONFIGURATIONS ===
+SETUP_DURATION = 60  # seconds for setup mode
+WHITELIST_FILE = "whitelist.json"
+ALERT_LOG_FILE = "alerts.txt"
+OBSERVED_PACKET_LOG_FILE = "observed_packets.csv"
+
+# === GLOBAL VARIABLES ===
+whitelist = {}  # MAC -> IP
+logged_alerts = set()
+mac_ip_map = {}  # Track MAC and IP pairs
+
+# Known vendor OUIs (first 3 bytes of MAC)
+KNOWN_OUIS = {
+    "F8:A2:D6"
+}
+
+# === FILTERING === 
+def is_private_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_private
+    except Exception:
+        return False
+
+def is_multicast_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return ip.is_multicast
+    except Exception:
+        return False
+
+def is_multicast_or_broadcast_mac(mac: str) -> bool:
+    if not mac:
+        return False
+    m = mac.lower()
+    return (
+        m == "ff:ff:ff:ff:ff:ff" or  # broadcast
+        m.startswith("01:00:5e") or  # IPv4 multicast
+        m.startswith("33:33:")       # IPv6 multicast
+    )
+
+# === SETUP MODE ===
+def setup_mode():
+    print(f"[SETUP MODE] Gathering MAC addresses for {SETUP_DURATION} seconds...")
+    captured_devices = {}
+
+    def collect_macs(pkt):
+        mac, ip = None, None
+        
+        if pkt.haslayer(ARP) and pkt[ARP].op in (1, 2):
+            mac = pkt[ARP].hwsrc
+            ip = pkt[ARP].psrc
+        elif pkt.haslayer(Ether) and pkt.haslayer(IP):
+            mac = pkt[Ether].src
+            ip  = pkt[IP].src
+        else:
+            return
+        
+        if not mac or is_multicast_or_broadcast_mac(mac):
+            return
+        if not is_private_ip(ip):
+            return
+        
+        if mac not in captured_devices:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            captured_devices[mac] = ip
+            print(f"[{timestamp}] [NEW DEVICE] MAC: {mac:<17} | IP: {ip}")
+
+    sniff(prn=collect_macs, store=0, timeout=SETUP_DURATION, filter="arp or (ip and not icmp)")
+
+    print(f"[SETUP COMPLETE] {len(captured_devices)} devices detected.")
+    global whitelist
+    whitelist = captured_devices
+
+    # Save whitelist
+    with open(WHITELIST_FILE, "w") as f:
+        json.dump(whitelist, f, indent=4)
+    print(f"[INFO] Whitelist saved to {WHITELIST_FILE}")
+
+
+# === DETECTION MODE ===
+def detection_mode():
+    print("\n[DETECTION MODE] Monitoring for anomalies (Press Ctrl + C to stop)...")
+    open(ALERT_LOG_FILE, "w").close()
+    # Ensure packet log CSV exists with headers
+    if not os.path.exists(OBSERVED_PACKET_LOG_FILE):
+        with open(OBSERVED_PACKET_LOG_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Timestamp", "Source MAC", "Destination MAC", "Source IP", "Destination IP"])
+
+    def detect(pkt):
+        if pkt.haslayer(ARP):
+            src_mac = pkt[ARP].hwsrc
+            dst_mac = pkt[ARP].hwdst
+            src_ip = pkt[ARP].psrc
+            dst_ip = pkt[ARP].pdst
+            op_code = pkt[ARP].op
+            op_status = "REQUEST" if op_code == 1 else "REPLY" if op_code == 2 else f"OP={op_code}"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Log packet
+            with open(OBSERVED_PACKET_LOG_FILE, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, src_mac, dst_mac, src_ip, dst_ip])
+            
+            # Only print ARP lines that has priv IPs and non-multi or broadcast MACs
+            if is_private_ip(src_ip) and is_private_ip(dst_ip) and not is_multicast_or_broadcast_mac(src_mac) and not is_multicast_or_broadcast_mac(dst_mac):
+                print(f"[{timestamp}] " f"[ARP:{op_status}] " f"SRC: {src_mac:<17} ({src_ip:<15}) " f"-> DST: {dst_mac:<17} ({dst_ip:<15})")
+            
+            # Track MAC-IP mapping for duplicate detection
+            if is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac):
+                if src_mac in mac_ip_map:
+                    if mac_ip_map[src_mac] != src_ip and is_private_ip(mac_ip_map[src_mac]):
+                        alert = f"[ALERT - DUPLICATE MAC] {src_mac} seen on multiple local IPs: {mac_ip_map[src_mac]} and {src_ip} at {timestamp}"
+                        log_alert(alert)
+                else:   
+                    mac_ip_map[src_mac] = src_ip
+
+                # Unknown device detection
+                if src_mac not in whitelist: #and src_mac not in logged_alerts:
+                    alert = f"[ALERT - UNKNOWN DEVICE] New MAC detected: {src_mac} ({src_ip}) at {timestamp}"
+                    log_alert(alert)
+
+                # Suspicious vendor detection
+                mac_prefix = src_mac.upper()[0:8]
+                if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist and src_mac not in logged_alerts:
+                    alert = f"[ALERT - SUSPICIOUS VENDOR] MAC prefix {mac_prefix} not recognized for {src_mac} ({src_ip}) at {timestamp}"
+                    log_alert(alert)
+                    logged_alerts.add(src_mac)
+                
+        elif pkt.haslayer(Ether) and pkt.haslayer(IP):
+            src_mac = pkt[Ether].src
+            dst_mac = pkt[Ether].dst
+            src_ip  = pkt[IP].src
+            dst_ip  = pkt[IP].dst
+            op_status = "IP"  # just a tag for printing
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Log packet
+            with open(OBSERVED_PACKET_LOG_FILE, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, src_mac, dst_mac, src_ip, dst_ip])
+             
+            # Print
+            if (
+                is_private_ip(src_ip) and is_private_ip(dst_ip) and
+                not is_multicast_or_broadcast_mac(src_mac) and
+                not is_multicast_or_broadcast_mac(dst_mac) and
+                not is_multicast_ip(src_ip) and
+                not is_multicast_ip(dst_ip)
+            ):   
+                print(f"[{timestamp}] [ETH:{op_status}] SRC: {src_mac:<17} ({src_ip:<15}) -> DST: {dst_mac:<17} ({dst_ip:<15})")
+
+            # Track MAC-IP mapping for duplicate detection
+            if is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac) and not is_multicast_ip(src_ip):
+                if src_mac in mac_ip_map:
+                    if mac_ip_map[src_mac] != src_ip and is_private_ip(mac_ip_map[src_mac]):
+                        alert = f"[ALERT - DUPLICATE MAC] {src_mac} seen on multiple IPs: {mac_ip_map[src_mac]} and {src_ip} at {timestamp}"
+                        log_alert(alert)
+                else:
+                    mac_ip_map[src_mac] = src_ip
+
+                # Unknown device detection
+                if src_mac not in whitelist:
+                    alert = f"[ALERT - UNKNOWN DEVICE] New MAC detected: {src_mac} ({src_ip}) at {timestamp}"
+                    log_alert(alert)
+
+                # Suspicious vendor detection
+                mac_prefix = src_mac.upper()[0:8]
+                if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist and src_mac not in logged_alerts:
+                    alert = f"[ALERT - SUSPICIOUS VENDOR] MAC prefix {mac_prefix} not recognized for {src_mac} ({src_ip}) at {timestamp}"
+                    log_alert(alert)
+                    logged_alerts.add(src_mac)
+                
+    sniff(prn=detect, store=0, filter="arp or (ip and not icmp)")
+
+# === HELPER FUNCTION ===
+log_lock = threading.Lock()
+def log_alert(message):
+    with log_lock:
+        print(f"     {message}", flush=True)
+        with open(ALERT_LOG_FILE, "a") as f:
+            f.write(message + "\n")
+
+# === WHITELIST REVIEW / EDIT ===
+def _normalize_mac(mac: str) -> str:
+    return mac.strip().lower()
+
+def _valid_mac(mac: str) -> bool:
+    m = mac.strip().lower()
+    parts = m.split(":")
+    if len(parts) != 6:
+        return False
+    try:
+        return all(len(p) == 2 and int(p, 16) >= 0 for p in parts)
+    except ValueError:
+        return False
+
+def _print_whitelist():
+    if not whitelist:
+        print("\n[WHITELIST] (empty)")
+        return
+    print("\n[WHITELIST] Authorized devices:")
+    for i, (mac, ip) in enumerate(sorted(whitelist.items()), start=1):
+        print(f"  {i:2d}. {mac}  ->  {ip}")
+
+def review_and_edit_whitelist():
+    while True:
+        _print_whitelist()
+        print("\nOptions: [A]dd  [R]emove  [C]ontinue to detection")
+        choice = input("Choose an option (A/R/C): ").strip().lower()
+
+        if choice == "a":
+            mac = input("  Enter MAC to add (format xx:xx:xx:xx:xx:xx): ").strip()
+            if not _valid_mac(mac):
+                print("  [!] Invalid MAC format. Try again.")
+                continue
+            mac = _normalize_mac(mac)
+            ip = input("  Enter last-seen IP for this MAC (or press Enter to leave blank): ").strip()
+            ip = ip if ip else "unknown"
+            whitelist[mac] = ip
+            print(f"  [+] Added {mac} -> {ip}")
+
+        elif choice == "r":
+            key = input("  Enter MAC or list number to remove: ").strip().lower()
+            # try index first
+            removed = False
+            if key.isdigit():
+                idx = int(key)
+                items = sorted(list(whitelist.items()))
+                if 1 <= idx <= len(items):
+                    mac_to_remove = items[idx - 1][0]
+                    whitelist.pop(mac_to_remove, None)
+                    print(f"  [-] Removed {mac_to_remove}")
+                    removed = True
+            if not removed:
+                mac = _normalize_mac(key)
+                if mac in whitelist:
+                    whitelist.pop(mac, None)
+                    print(f"  [-] Removed {mac}")
+                else:
+                    print("  [!] Not found in whitelist.")
+
+        elif choice == "c":
+            # Save whitelist and confirm proceed
+            with open(WHITELIST_FILE, "w") as f:
+                json.dump(whitelist, f, indent=4)
+            print(f"\n[INFO] Whitelist saved to {WHITELIST_FILE}")
+            confirm = input("Proceed to detection mode? (y/n): ").strip().lower()
+            if confirm == "y":
+                return True
+            else:
+                print("Okay, you can continue editing.")
+        else:
+            print("  [!] Invalid option. Please choose A, R, or C.")
+
+# === MAIN EXECUTION ===
+if __name__ == "__main__":
+    print("=== MAC Address Anomaly Detector ===")
+    print("1. Setup Mode (Collect MACs)")
+    print("2. Detection Mode (Monitor Network)\n")
+
+    setup_mode()  # Step 1: Collect whitelist for 15 seconds
+    
+    review_and_edit_whitelist()
+
+    try:
+        detection_mode()
+    except KeyboardInterrupt:
+        print("\n[EXIT] Detection stopped by user.")
+    finally:
+        print(f"\n[INFO] Alerts saved in {ALERT_LOG_FILE}")
+        print(f"[INFO] Packet logs saved in {OBSERVED_PACKET_LOG_FILE}")
+        print(f"[INFO] Whitelist saved in {WHITELIST_FILE}")
