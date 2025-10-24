@@ -16,7 +16,7 @@ OBSERVED_PACKET_LOG_FILE = "observed_packets.csv"
 # === GLOBAL VARIABLES ===
 whitelist = {}  # MAC -> IP
 logged_alerts = set()
-mac_ip_map = {}  # Track MAC and IP pairs
+ip_mac_map = { }
 
 # Known vendor OUIs (first 3 bytes of MAC)
 KNOWN_OUIS = {
@@ -118,12 +118,12 @@ def detection_mode():
             
             # Track MAC-IP mapping for duplicate detection
             if is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac):
-                if src_mac in mac_ip_map:
-                    if mac_ip_map[src_mac] != src_ip and is_private_ip(mac_ip_map[src_mac]):
-                        alert = f"[ALERT - DUPLICATE MAC] {src_mac} seen on multiple local IPs: {mac_ip_map[src_mac]} and {src_ip} at {timestamp}"
+                if src_ip in ip_mac_map:
+                    if ip_mac_map[src_ip] != src_mac and is_private_ip(src_ip):
+                        alert = f"[ALERT - POTENTIAL MAC SPOOFING] IP{src_ip} seen on multiple MAC Addresses: {ip_mac_map[src_ip]} and {src_mac} at {timestamp}"
                         log_alert(alert)
                 else:   
-                    mac_ip_map[src_mac] = src_ip
+                    ip_mac_map[src_ip] = src_mac
 
                 # Unknown device detection
                 if src_mac not in whitelist: #and src_mac not in logged_alerts:
@@ -162,12 +162,12 @@ def detection_mode():
 
             # Track MAC-IP mapping for duplicate detection
             if is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac) and not is_multicast_ip(src_ip):
-                if src_mac in mac_ip_map:
-                    if mac_ip_map[src_mac] != src_ip and is_private_ip(mac_ip_map[src_mac]):
-                        alert = f"[ALERT - DUPLICATE MAC] {src_mac} seen on multiple IPs: {mac_ip_map[src_mac]} and {src_ip} at {timestamp}"
+                if src_ip in ip_mac_map:
+                    if ip_mac_map[src_ip] != src_mac and is_private_ip(src_ip):
+                        alert = f"[ALERT - POTENTIAL MAC SPOOFING] IP{src_ip} seen on multiple MAC Addresses: {ip_mac_map[src_ip]} and {src_mac} at {timestamp}"
                         log_alert(alert)
-                else:
-                    mac_ip_map[src_mac] = src_ip
+                else:   
+                    ip_mac_map[src_ip] = src_mac
 
                 # Unknown device detection
                 if src_mac not in whitelist:
