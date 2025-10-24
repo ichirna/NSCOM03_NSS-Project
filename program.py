@@ -1,5 +1,4 @@
 from scapy.all import sniff, ARP, Ether, IP
-import time
 import json
 import csv
 import os
