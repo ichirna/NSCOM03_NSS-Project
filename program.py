@@ -97,10 +97,10 @@ def setup_mode():
         mac, ip = None, None
 
         if pkt.haslayer(ARP) and pkt[ARP].op in (1, 2):
-            mac = norm_mac(pkt[ARP].hwsrc)
+            mac = pkt[ARP].hwsrc
             ip = pkt[ARP].psrc
         elif pkt.haslayer(Ether) and pkt.haslayer(IP):
-            mac = norm_mac(pkt[Ether].src)
+            mac = pkt[Ether].src
             ip  = pkt[IP].src
         else:
             return
@@ -115,40 +115,59 @@ def setup_mode():
             captured_devices[mac] = ip
             print(f"[{timestamp}] [NEW DEVICE] MAC: {mac} | IP: {ip}")
 
-    sniff(prn=collect_macs, store=0, timeout=SETUP_DURATION, filter="arp or (ip and not icmp)")
+    sniff(prn=collect_macs, store=0, timeout=SETUP_DURATION,
+          filter="arp or (ip and not icmp)")
 
     print(f"[SETUP COMPLETE] {len(captured_devices)} devices detected.")
 
-    # Load existing whitelist (CRITICAL for appending without overriding)
+    # ---------- MERGE INTO WHITELIST ----------
     global whitelist
-    if os.path.exists(WHITELIST_FILE) and os.path.getsize(WHITELIST_FILE) > 0:
-        try:
-            with open(WHITELIST_FILE, "r") as f:
-                # Use update() to load the existing list into the global 'whitelist' dictionary
-                whitelist.update(json.load(f))
-        except json.JSONDecodeError:
-            print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
-            whitelist = {}
-        except Exception as e:
-            print(f"[ERROR] Could not load existing whitelist: {e}. Starting with an empty whitelist.")
-            whitelist = {}
-
-    # Merge new devices, avoid duplicates
     added_count = 0
+    updated_count = 0
+
     for mac, ip in captured_devices.items():
         nm = norm_mac(mac)
         if not nm:
             continue
-        if nm not in whitelist:
-            vendor = oui_vendors.get(mac_oui(nm), "Unknown")
-            whitelist[nm] = {"ip": ip, "vendor": vendor}
-            added_count += 1
 
-    # Save updated whitelist (Use "w" to overwrite the complete, merged dictionary)
+        vendor = oui_vendors.get(mac_oui(nm), "Unknown")
+
+        if nm not in whitelist:
+            # brand-new device
+            whitelist[nm] = {
+                "ips": [ip],
+                "vendor": vendor,
+            }
+            added_count += 1
+        else:
+            # already in whitelist – refresh IP list and vendor if needed
+            meta = whitelist[nm]
+
+            if isinstance(meta, dict):
+                # ensure we have an "ips" list
+                if "ips" not in meta:
+                    old_ip = meta.get("ip")
+                    meta["ips"] = []
+                    if old_ip and old_ip != "unknown":
+                        meta["ips"].append(old_ip)
+                    if "ip" in meta:
+                        del meta["ip"]
+
+                # now meta["ips"] definitely exists
+                if ip not in meta["ips"]:
+                    meta["ips"].append(ip)
+                    updated_count += 1
+
+                # upgrade vendor if it was unknown before
+                if meta.get("vendor", "Unknown") == "Unknown" and vendor != "Unknown":
+                    meta["vendor"] = vendor
+
+    # Save updated whitelist
     with open(WHITELIST_FILE, "w") as f:
         json.dump(whitelist, f, indent=4)
 
-    print(f"[INFO] {added_count} new device(s) added to whitelist. Total whitelist size: {len(whitelist)}")
+    print(f"[INFO] {added_count} new device(s) added to whitelist, {updated_count} updated.")
+    print(f"[INFO] Total whitelist size: {len(whitelist)}")
 
 # === DETECTION MODE ===
 def detection_mode():
@@ -188,9 +207,30 @@ def detection_mode():
                     ip_mac_map[src_ip] = src_mac
 
                 # Unknown device detection
-                if src_mac not in whitelist: #and src_mac not in logged_alerts:
+                if src_mac not in whitelist:
                     alert = f"[ALERT - UNKNOWN DEVICE] New MAC detected: {src_mac} ({src_ip}) at {timestamp}"
                     log_alert(alert)
+                else:
+                    entry = whitelist[src_mac]
+
+                    # Case 1: New format already uses "ips"
+                    if "ips" in entry:
+                        if src_ip not in entry["ips"]:
+                            entry["ips"].append(src_ip)
+
+                    # Case 2: Old format: "ip": "something"
+                    else:
+                        old_ip = entry.get("ip")
+                        entry["ips"] = []
+                        if old_ip and old_ip != "unknown":
+                            entry["ips"].append(old_ip)
+                        if src_ip not in entry["ips"]:
+                            entry["ips"].append(src_ip)
+
+                        # Remove old "ip" key to avoid confusion
+                        if "ip" in entry:
+                            del entry["ip"]
+
 
                 # Suspicious vendor detection
                 if has_oui_db:
@@ -271,12 +311,17 @@ def _print_whitelist():
     print("\n[WHITELIST] Authorized devices:")
     for i, (mac, meta) in enumerate(sorted(whitelist.items()), start=1):
         if isinstance(meta, dict):
-            ip = meta.get("ip", "unknown")
+            # Prefer "ips" list if present
+            if "ips" in meta:
+                ips = meta.get("ips", [])
+                ip_display = ", ".join(ips) if ips else "unknown"
+            else:
+                ip_display = meta.get("ip", "unknown")
             vendor = meta.get("vendor", "Unknown")
         else:
-            ip = str(meta)
+            ip_display = str(meta)
             vendor = "Unknown"
-        print(f"  {i:2d}. {mac}  ->  {ip}  ({vendor})")
+        print(f"  {i:2d}. {mac}  ->  {ip_display}  ({vendor})")
 
 def review_and_edit_whitelist():
     while True:
@@ -337,32 +382,31 @@ if __name__ == "__main__":
     print("2. Detection Mode (Monitor Network)\n")
 
     if os.path.exists(WHITELIST_FILE) and os.path.getsize(WHITELIST_FILE) > 0:
-        try:
-            with open(WHITELIST_FILE, "r") as f:
-                whitelist.update(json.load(f))
-            print(f"[INFO] Loaded {len(whitelist)} existing whitelisted device(s).")
-            migrated = 0
-            for old_mac, val in list(whitelist.items()):
-                nm = norm_mac(old_mac)
-                if not nm:
-                    whitelist.pop(old_mac, None)
-                    continue
-                if isinstance(val, dict):
-                    if nm != old_mac:
-                        whitelist.pop(old_mac, None)
-                        whitelist[nm] = val
-                    continue
-                vendor = oui_vendors.get(mac_oui(nm), "Unknown") if has_oui_db else "Unknown"
-                whitelist.pop(old_mac, None)
-                whitelist[nm] = {"ip": val, "vendor": vendor}
-                migrated += 1
-            if migrated:
-                print(f"[INFO] Migrated {migrated} legacy whitelist entrie(s) to new schema.")
-        except json.JSONDecodeError:
-            print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
-        except Exception as e:
-            print(f"[ERROR] Could not load initial whitelist: {e}. Starting with an empty whitelist.")
+            try:
+                with open(WHITELIST_FILE, "r") as f:
+                    whitelist.update(json.load(f))
+                print(f"[INFO] Loaded {len(whitelist)} existing whitelisted device(s).")
 
+                migrated = 0
+                for mac, meta in list(whitelist.items()):
+                    if isinstance(meta, dict) and "ip" in meta and "ips" not in meta:
+                        ip = meta["ip"]
+                        meta["ips"] = []
+                        if ip and ip != "unknown":
+                            meta["ips"].append(ip)
+                        del meta["ip"]
+                        migrated += 1
+
+                if migrated:
+                    print(f"[INFO] Migrated {migrated} legacy whitelist entrie(s) to new schema.")
+
+            except json.JSONDecodeError:
+                print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
+                whitelist = {}
+            except Exception as e:
+                print(f"[ERROR] Could not load initial whitelist: {e}. Starting with an empty whitelist.")
+                whitelist = {}
+            
     setup_mode()
 
     review_and_edit_whitelist()
