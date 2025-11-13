@@ -427,7 +427,7 @@ def review_and_edit_whitelist():
     """
     while True:
         _print_whitelist()
-        print("\nOptions: [A]dd  [R]emove  [C]ontinue to detection")
+        print("\nOptions: [A]dd  [R]emove MAC  [P]rune IP  [C]ontinue to detection")
         choice = input("Choose an option (A/R/C): ").strip().lower()
 
         if choice == "a":
@@ -461,6 +461,68 @@ def review_and_edit_whitelist():
                     print(f"  [-] Removed {mac}")
                 else:
                     print("  [!] Not found in whitelist.")
+                    
+        elif choice == "p":
+            # Prune a single IP from a MAC that has multiple IPs
+            # Build a list of MACs that actually have >1 IP
+            candidates = [
+                (mac, meta)
+                for mac, meta in sorted(whitelist.items())
+                if isinstance(meta, dict) and len(meta.get("ips", [])) > 1
+            ]
+
+            if not candidates:
+                print("  [!] No entries with more than one IP to prune.")
+                continue
+
+            print("\n  MACs with multiple IPs:")
+            for idx, (mac, meta) in enumerate(candidates, start=1):
+                ips = meta.get("ips", [])
+                print(f"   {idx:2d}. {mac} -> {', '.join(ips)}")
+
+            sel = input("  Select MAC by number (or 'q' to cancel): ").strip().lower()
+            if sel == "q":
+                continue
+            if not sel.isdigit():
+                print("  [!] Invalid selection.")
+                continue
+
+            mac_idx = int(sel)
+            if not (1 <= mac_idx <= len(candidates)):
+                print("  [!] Invalid selection.")
+                continue
+
+            mac_sel, meta_sel = candidates[mac_idx - 1]
+            ips = meta_sel.get("ips", [])
+
+            # Safety check
+            if len(ips) <= 1:
+                print("  [!] This entry does not have more than one IP. Nothing to prune.")
+                continue
+
+            print(f"  IPs for {mac_sel}:")
+            for i_ip, ip_val in enumerate(ips, start=1):
+                print(f"    {i_ip:2d}. {ip_val}")
+
+            ip_sel = input("  Select IP to remove by number (or 'q' to cancel): ").strip().lower()
+            if ip_sel == "q":
+                continue
+            if not ip_sel.isdigit():
+                print("  [!] Invalid selection.")
+                continue
+
+            ip_idx = int(ip_sel)
+            if not (1 <= ip_idx <= len(ips)):
+                print("  [!] Invalid IP selection.")
+                continue
+
+            # Do not allow removing last remaining IP
+            if len(ips) <= 1:
+                print("  [!] Cannot remove the last IP for this MAC.")
+                continue
+
+            removed_ip = ips.pop(ip_idx - 1)
+            print(f"  [-] Removed IP {removed_ip} from {mac_sel}")
 
         elif choice == "c":
             # FIXED: Change from "a" (append) to "w" (write/overwrite) to ensure a single, valid JSON object is saved.
@@ -473,7 +535,7 @@ def review_and_edit_whitelist():
             else:
                 print("Okay, you can continue editing.")
         else:
-            print("  [!] Invalid option. Please choose A, R, or C.")
+            print("  [!] Invalid option. Please choose A, R, P, or C.")
 
 # === MAIN EXECUTION ===
 if __name__ == "__main__":
