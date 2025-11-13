@@ -5,6 +5,7 @@ import os
 import threading
 from datetime import datetime
 import ipaddress
+import re
 
 SETUP_DURATION = 60
 WHITELIST_FILE = "whitelist.json"
@@ -15,10 +16,52 @@ whitelist = {}
 logged_alerts = set()
 ip_mac_map = { }
 
-# Known vendor OUIs (first 3 bytes of MAC)
-KNOWN_OUIS = {
-    "F8:A2:D6"
-}
+# === OUI ===
+OUI_FILE = "oui.csv"
+oui_vendors = {}
+has_oui_db = False
+
+def load_oui_vendors():
+    global oui_vendors, has_oui_db
+    if not os.path.exists(OUI_FILE):
+        print(f"[WARNING] {OUI_FILE} not found. Vendor lookup disabled.")
+        has_oui_db = False
+        return
+
+    try:
+        with open(OUI_FILE, newline="", encoding="utf-8", errors="ignore") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                raw = (row.get("Assignment", "") or "").strip().upper()
+                hexes = re.sub(r"[^0-9A-F]", "", raw)
+                if len(hexes) != 6:
+                    continue
+                oui = ":".join(hexes[i:i+2] for i in range(0, 6, 2))
+                vendor = (row.get("Organization Name", "") or "").strip()
+                if vendor:
+                    oui_vendors[oui] = vendor
+
+        has_oui_db = len(oui_vendors) > 0
+        print(f"[INFO] Loaded {len(oui_vendors)} vendor OUIs from {OUI_FILE}.")
+    except Exception as e:
+        has_oui_db = False
+        print(f"[ERROR] Failed to load {OUI_FILE}: {e}")
+
+def norm_mac(mac: str) -> str:
+    """aa:bb:cc:dd:ee:ff (lowercase). Returns '' if invalid."""
+    if not mac:
+        return ""
+    hexes = re.sub(r'[^0-9A-Fa-f]', '', mac)
+    if len(hexes) != 12:
+        return ""
+    return ":".join(hexes[i:i+2] for i in range(0, 12, 2)).lower()
+
+def mac_oui(mac: str) -> str:
+    """Return OUI like 'F8:A2:D6' from any MAC string (or '' if invalid)."""
+    m = norm_mac(mac)
+    if not m:
+        return ""
+    return m[:8].upper()
 
 # === FILTERING ===
 def is_private_ip(ip_str: str) -> bool:
@@ -54,10 +97,10 @@ def setup_mode():
         mac, ip = None, None
 
         if pkt.haslayer(ARP) and pkt[ARP].op in (1, 2):
-            mac = pkt[ARP].hwsrc
+            mac = norm_mac(pkt[ARP].hwsrc)
             ip = pkt[ARP].psrc
         elif pkt.haslayer(Ether) and pkt.haslayer(IP):
-            mac = pkt[Ether].src
+            mac = norm_mac(pkt[Ether].src)
             ip  = pkt[IP].src
         else:
             return
@@ -93,8 +136,12 @@ def setup_mode():
     # Merge new devices, avoid duplicates
     added_count = 0
     for mac, ip in captured_devices.items():
-        if mac not in whitelist:
-            whitelist[mac] = ip
+        nm = norm_mac(mac)
+        if not nm:
+            continue
+        if nm not in whitelist:
+            vendor = oui_vendors.get(mac_oui(nm), "Unknown")
+            whitelist[nm] = {"ip": ip, "vendor": vendor}
             added_count += 1
 
     # Save updated whitelist (Use "w" to overwrite the complete, merged dictionary)
@@ -114,8 +161,10 @@ def detection_mode():
 
     def detect(pkt):
         if pkt.haslayer(ARP):
-            src_mac = pkt[ARP].hwsrc
-            dst_mac = pkt[ARP].hwdst
+            src_mac_raw = pkt[ARP].hwsrc
+            dst_mac_raw = pkt[ARP].hwdst
+            src_mac = norm_mac(src_mac_raw)
+            dst_mac = norm_mac(dst_mac_raw)
             src_ip = pkt[ARP].psrc
             dst_ip = pkt[ARP].pdst
             op_code = pkt[ARP].op
@@ -130,7 +179,7 @@ def detection_mode():
                 print(f"[{timestamp}] " f"[ARP:{op_status}] " f"SRC: {src_mac:<17} ({src_ip:<15}) " f"-> DST: {dst_mac:<17} ({dst_ip:<15})")
 
             # Track MAC-IP mapping for duplicate detection
-            if is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac):
+            if src_mac and is_private_ip(src_ip) and not is_multicast_or_broadcast_mac(src_mac):
                 if src_ip in ip_mac_map:
                     if ip_mac_map[src_ip] != src_mac and is_private_ip(src_ip):
                         alert = f"[ALERT - POTENTIAL MAC SPOOFING] IP{src_ip} seen on multiple MAC Addresses: {ip_mac_map[src_ip]} and {src_mac} at {timestamp}"
@@ -144,15 +193,18 @@ def detection_mode():
                     log_alert(alert)
 
                 # Suspicious vendor detection
-                mac_prefix = src_mac.upper()[0:8]
-                if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist and src_mac not in logged_alerts:
-                    alert = f"[ALERT - SUSPICIOUS VENDOR] MAC prefix {mac_prefix} not recognized for {src_mac} ({src_ip}) at {timestamp}"
-                    log_alert(alert)
-                    logged_alerts.add(src_mac)
+                if has_oui_db:
+                    vendor = oui_vendors.get(mac_oui(src_mac))
+                    if not vendor and src_mac not in whitelist and src_mac not in logged_alerts:
+                        alert = f"[ALERT - UNKNOWN VENDOR] No OUI match for {src_mac} ({src_ip}) at {timestamp}"
+                        log_alert(alert)
+                        logged_alerts.add(src_mac)
 
         elif pkt.haslayer(Ether) and pkt.haslayer(IP):
-            src_mac = pkt[Ether].src
-            dst_mac = pkt[Ether].dst
+            src_mac_raw = pkt[Ether].src
+            dst_mac_raw = pkt[Ether].dst
+            src_mac = norm_mac(src_mac_raw)
+            dst_mac = norm_mac(dst_mac_raw)
             src_ip  = pkt[IP].src
             dst_ip  = pkt[IP].dst
             op_status = "IP"
@@ -185,11 +237,12 @@ def detection_mode():
                     log_alert(alert)
 
                 # Suspicious vendor detection
-                mac_prefix = src_mac.upper()[0:8]
-                if mac_prefix not in KNOWN_OUIS and src_mac not in whitelist and src_mac not in logged_alerts:
-                    alert = f"[ALERT - SUSPICIOUS VENDOR] MAC prefix {mac_prefix} not recognized for {src_mac} ({src_ip}) at {timestamp}"
-                    log_alert(alert)
-                    logged_alerts.add(src_mac)
+                if has_oui_db:
+                    vendor = oui_vendors.get(mac_oui(src_mac))
+                    if not vendor and src_mac not in whitelist and src_mac not in logged_alerts:
+                        alert = f"[ALERT - UNKNOWN VENDOR] No OUI match for {src_mac} ({src_ip}) at {timestamp}"
+                        log_alert(alert)
+                        logged_alerts.add(src_mac)
 
     sniff(prn=detect, store=0, filter="arp or (ip and not icmp)")
 
@@ -201,9 +254,6 @@ def log_alert(message):
             f.write(message + "\n")
 
 # === WHITELIST REVIEW / EDIT ===
-def _normalize_mac(mac: str) -> str:
-    return mac.strip().lower()
-
 def _valid_mac(mac: str) -> bool:
     m = mac.strip().lower()
     parts = m.split(":")
@@ -219,8 +269,14 @@ def _print_whitelist():
         print("\n[WHITELIST] (empty)")
         return
     print("\n[WHITELIST] Authorized devices:")
-    for i, (mac, ip) in enumerate(sorted(whitelist.items()), start=1):
-        print(f"  {i:2d}. {mac}  ->  {ip}")
+    for i, (mac, meta) in enumerate(sorted(whitelist.items()), start=1):
+        if isinstance(meta, dict):
+            ip = meta.get("ip", "unknown")
+            vendor = meta.get("vendor", "Unknown")
+        else:
+            ip = str(meta)
+            vendor = "Unknown"
+        print(f"  {i:2d}. {mac}  ->  {ip}  ({vendor})")
 
 def review_and_edit_whitelist():
     while True:
@@ -233,10 +289,12 @@ def review_and_edit_whitelist():
             if not _valid_mac(mac):
                 print("  [!] Invalid MAC format. Try again.")
                 continue
-            mac = _normalize_mac(mac)
+            mac = norm_mac(mac)
             ip = input("  Enter last-seen IP for this MAC (or press Enter to leave blank): ").strip()
             ip = ip if ip else "unknown"
-            whitelist[mac] = ip # Dictionary update naturally prevents duplicates
+            vendor = oui_vendors.get(mac_oui(mac), "Unknown") if has_oui_db else "Unknown"
+            whitelist[mac] = {"ip": ip, "vendor": vendor}
+
             print(f"  [+] Added {mac} -> {ip}")
 
         elif choice == "r":
@@ -251,7 +309,7 @@ def review_and_edit_whitelist():
                     print(f"  [-] Removed {mac_to_remove}")
                     removed = True
             if not removed:
-                mac = _normalize_mac(key)
+                mac = norm_mac(key)
                 if mac in whitelist:
                     whitelist.pop(mac, None)
                     print(f"  [-] Removed {mac}")
@@ -274,6 +332,7 @@ def review_and_edit_whitelist():
 # === MAIN EXECUTION ===
 if __name__ == "__main__":
     print("=== MAC Address Anomaly Detector ===")
+    load_oui_vendors()
     print("1. Setup Mode (Collect MACs)")
     print("2. Detection Mode (Monitor Network)\n")
 
@@ -282,6 +341,23 @@ if __name__ == "__main__":
             with open(WHITELIST_FILE, "r") as f:
                 whitelist.update(json.load(f))
             print(f"[INFO] Loaded {len(whitelist)} existing whitelisted device(s).")
+            migrated = 0
+            for old_mac, val in list(whitelist.items()):
+                nm = norm_mac(old_mac)
+                if not nm:
+                    whitelist.pop(old_mac, None)
+                    continue
+                if isinstance(val, dict):
+                    if nm != old_mac:
+                        whitelist.pop(old_mac, None)
+                        whitelist[nm] = val
+                    continue
+                vendor = oui_vendors.get(mac_oui(nm), "Unknown") if has_oui_db else "Unknown"
+                whitelist.pop(old_mac, None)
+                whitelist[nm] = {"ip": val, "vendor": vendor}
+                migrated += 1
+            if migrated:
+                print(f"[INFO] Migrated {migrated} legacy whitelist entrie(s) to new schema.")
         except json.JSONDecodeError:
             print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
         except Exception as e:
