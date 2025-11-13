@@ -7,21 +7,48 @@ from datetime import datetime
 import ipaddress
 import re
 
+"""
+MAC Address Anomaly Detector
+
+- Setup mode:
+    * Sniffs ARP/IP packets for a fixed duration.
+    * Learns devices on the LAN and stores them in a whitelist (MAC -> vendor + list of IPs).
+- Detection mode:
+    * Continuously sniffs ARP/IP packets.
+    * Logs all observed packets to a CSV.
+    * Detects anomalies:
+        - Unknown devices (MAC not in whitelist).
+        - Potential MAC spoofing (same IP used by multiple MAC addresses).
+        - Unknown vendors (no matching OUI in the OUI database).
+    * Writes alerts to a log file.
+"""
+
+# Seconds to stay in setup mode snifing for devices
 SETUP_DURATION = 60
+
+# File paths for persistent data/logs
 WHITELIST_FILE = "whitelist.json"
 ALERT_LOG_FILE = "alerts.txt"
 OBSERVED_PACKET_LOG_FILE = "observed_packets.csv"
 
+# In-memory state
 whitelist = {}
 logged_alerts = set()
 ip_mac_map = { }
 
-# === OUI ===
+# OUI database
 OUI_FILE = "oui.csv"
 oui_vendors = {}
 has_oui_db = False
 
 def load_oui_vendors():
+    """
+    Load OUI -> vendor mappings from oui.csv into oui_vendors.
+
+    Expected CSV columns:
+        - "Assignment": first 3 bytes of MAC (e.g. "F8-A2-D6").
+        - "Organization Name": vendor name.
+    """
     global oui_vendors, has_oui_db
     if not os.path.exists(OUI_FILE):
         print(f"[WARNING] {OUI_FILE} not found. Vendor lookup disabled.")
@@ -48,7 +75,12 @@ def load_oui_vendors():
         print(f"[ERROR] Failed to load {OUI_FILE}: {e}")
 
 def norm_mac(mac: str) -> str:
-    """aa:bb:cc:dd:ee:ff (lowercase). Returns '' if invalid."""
+    """
+    Normalize any MAC string into lowercase 'aa:bb:cc:dd:ee:ff' form.
+    Returns '' if the input is invalid.
+
+    This makes comparisons consistent even if Scapy or OS prints MACs differently.
+    """
     if not mac:
         return ""
     hexes = re.sub(r'[^0-9A-Fa-f]', '', mac)
@@ -57,14 +89,21 @@ def norm_mac(mac: str) -> str:
     return ":".join(hexes[i:i+2] for i in range(0, 12, 2)).lower()
 
 def mac_oui(mac: str) -> str:
-    """Return OUI like 'F8:A2:D6' from any MAC string (or '' if invalid)."""
+    """
+    Extract the OUI (first 3 bytes) from a MAC address and return as 'F8:A2:D6'.
+    Returns '' if MAC is invalid.
+    """
     m = norm_mac(mac)
     if not m:
         return ""
     return m[:8].upper()
 
-# === FILTERING ===
+# === FILTERING HELPERS ===
 def is_private_ip(ip_str: str) -> bool:
+    """
+    Return True if the IP string is a private address.
+    We only care about private LAN traffic for this detector.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
         return ip.is_private
@@ -72,6 +111,10 @@ def is_private_ip(ip_str: str) -> bool:
         return False
 
 def is_multicast_ip(ip_str: str) -> bool:
+    """
+    Return True if IP string is a multicast address.
+    Multicast addresses are ignored for anomaly detection.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
         return ip.is_multicast
@@ -79,6 +122,10 @@ def is_multicast_ip(ip_str: str) -> bool:
         return False
 
 def is_multicast_or_broadcast_mac(mac: str) -> bool:
+    """
+    Return True if the MAC is broadcast or a known multicast MAC prefix.
+    These are excluded from whitelist and spoofing detection.
+    """
     if not mac:
         return False
     m = mac.lower()
@@ -90,20 +137,33 @@ def is_multicast_or_broadcast_mac(mac: str) -> bool:
 
 # === SETUP MODE ===
 def setup_mode():
+    """
+    Setup mode:
+    - Sniff for a fixed duration.
+    - Learn devices from ARP and non-ICMP IP traffic.
+    - Merge (MAC -> {ips, vendor}) into the whitelist.
+    """
     print(f"[SETUP MODE] Gathering MAC addresses for {SETUP_DURATION} seconds...")
     captured_devices = {}
 
     def collect_macs(pkt):
+        """
+        Packet handler for setup mode.
+        Extracts MAC + IP from ARP or IP packets and stores them in captured_devices.
+        """
         mac, ip = None, None
 
+        # ARP
         if pkt.haslayer(ARP) and pkt[ARP].op in (1, 2):
             mac = pkt[ARP].hwsrc
             ip = pkt[ARP].psrc
+            
+        # IP over Ethernet
         elif pkt.haslayer(Ether) and pkt.haslayer(IP):
             mac = pkt[Ether].src
             ip  = pkt[IP].src
         else:
-            return
+            return # ignore
 
         if not mac or is_multicast_or_broadcast_mac(mac):
             return
@@ -115,12 +175,13 @@ def setup_mode():
             captured_devices[mac] = ip
             print(f"[{timestamp}] [NEW DEVICE] MAC: {mac} | IP: {ip}")
 
+    # Sniff packets for the setup duration
     sniff(prn=collect_macs, store=0, timeout=SETUP_DURATION,
           filter="arp or (ip and not icmp)")
 
     print(f"[SETUP COMPLETE] {len(captured_devices)} devices detected.")
 
-    # ---------- MERGE INTO WHITELIST ----------
+    # MERGE INTO WHITELIST
     global whitelist
     added_count = 0
     updated_count = 0
@@ -133,18 +194,18 @@ def setup_mode():
         vendor = oui_vendors.get(mac_oui(nm), "Unknown")
 
         if nm not in whitelist:
-            # brand-new device
+            # Brand-new device
             whitelist[nm] = {
                 "ips": [ip],
                 "vendor": vendor,
             }
             added_count += 1
         else:
-            # already in whitelist – refresh IP list and vendor if needed
+            # Already in whitelist, refresh IP list and vendor if needed
             meta = whitelist[nm]
 
             if isinstance(meta, dict):
-                # ensure we have an "ips" list
+                # Ensure we have an "ips" list
                 if "ips" not in meta:
                     old_ip = meta.get("ip")
                     meta["ips"] = []
@@ -153,12 +214,12 @@ def setup_mode():
                     if "ip" in meta:
                         del meta["ip"]
 
-                # now meta["ips"] definitely exists
+                # Now meta["ips"] definitely exists
                 if ip not in meta["ips"]:
                     meta["ips"].append(ip)
                     updated_count += 1
 
-                # upgrade vendor if it was unknown before
+                # Upgrade vendor if it was unknown before
                 if meta.get("vendor", "Unknown") == "Unknown" and vendor != "Unknown":
                     meta["vendor"] = vendor
 
@@ -171,14 +232,35 @@ def setup_mode():
 
 # === DETECTION MODE ===
 def detection_mode():
+    """
+    Detection mode:
+    - Sniffs ARP and non-ICMP IP packets continuously.
+    - Logs all observed packets to CSV.
+    - Generates alerts for:
+        * Potential MAC spoofing (same IP -> multiple MACs).
+        * Unknown devices (MAC not in whitelist).
+        * Unknown vendors (no matching OUI in DB).
+    """
     print("\n[DETECTION MODE] Monitoring for anomalies (Press Ctrl + C to stop)...")
+    
+    # Resets alerts file at the start of each run
     open(ALERT_LOG_FILE, "w").close()
+    
+    # Initialize observed packets CSV
     if not os.path.exists(OBSERVED_PACKET_LOG_FILE):
         with open(OBSERVED_PACKET_LOG_FILE, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["Timestamp", "Source MAC", "Destination MAC", "Source IP", "Destination IP"])
 
     def detect(pkt):
+        """
+        Packet handler for detection mode.
+        Processes ARP and IP packets and performs:
+        - Logging
+        - Spoofing checks
+        - Unknown device/vendor detection
+        """
+        # ARP Packet
         if pkt.haslayer(ARP):
             src_mac_raw = pkt[ARP].hwsrc
             dst_mac_raw = pkt[ARP].hwdst
@@ -231,7 +313,6 @@ def detection_mode():
                         if "ip" in entry:
                             del entry["ip"]
 
-
                 # Suspicious vendor detection
                 if has_oui_db:
                     vendor = oui_vendors.get(mac_oui(src_mac))
@@ -240,6 +321,7 @@ def detection_mode():
                         log_alert(alert)
                         logged_alerts.add(src_mac)
 
+        # IP over Ethernet Packet
         elif pkt.haslayer(Ether) and pkt.haslayer(IP):
             src_mac_raw = pkt[Ether].src
             dst_mac_raw = pkt[Ether].dst
@@ -287,7 +369,12 @@ def detection_mode():
     sniff(prn=detect, store=0, filter="arp or (ip and not icmp)")
 
 log_lock = threading.Lock()
+
 def log_alert(message):
+    """
+    Print an alert to the console and append it to ALERT_LOG_FILE.
+    Protected by a lock so multiple alerts don't interleave writes.
+    """
     with log_lock:
         print(f"    {message}", flush=True)
         with open(ALERT_LOG_FILE, "a") as f:
@@ -295,6 +382,10 @@ def log_alert(message):
 
 # === WHITELIST REVIEW / EDIT ===
 def _valid_mac(mac: str) -> bool:
+    """
+    Basic syntax checker for MAC addresses entered by the user.
+    Only checks format 'xx:xx:xx:xx:xx:xx' and hex validity.
+    """
     m = mac.strip().lower()
     parts = m.split(":")
     if len(parts) != 6:
@@ -305,6 +396,10 @@ def _valid_mac(mac: str) -> bool:
         return False
 
 def _print_whitelist():
+    """
+    Pretty-print the current whitelist to the console.
+    Handles both old format ("ip") and new format ("ips").
+    """
     if not whitelist:
         print("\n[WHITELIST] (empty)")
         return
@@ -324,6 +419,12 @@ def _print_whitelist():
         print(f"  {i:2d}. {mac}  ->  {ip_display}  ({vendor})")
 
 def review_and_edit_whitelist():
+    """
+    Simple interactive CLI to:
+        - Add MACs to whitelist.
+        - Remove MACs by address or index.
+        - Save and continue to detection mode.
+    """
     while True:
         _print_whitelist()
         print("\nOptions: [A]dd  [R]emove  [C]ontinue to detection")
@@ -381,31 +482,33 @@ if __name__ == "__main__":
     print("1. Setup Mode (Collect MACs)")
     print("2. Detection Mode (Monitor Network)\n")
 
+    # Load existing whitelist if available
     if os.path.exists(WHITELIST_FILE) and os.path.getsize(WHITELIST_FILE) > 0:
-            try:
-                with open(WHITELIST_FILE, "r") as f:
-                    whitelist.update(json.load(f))
-                print(f"[INFO] Loaded {len(whitelist)} existing whitelisted device(s).")
+        try:
+            with open(WHITELIST_FILE, "r") as f:
+                whitelist.update(json.load(f))
+            print(f"[INFO] Loaded {len(whitelist)} existing whitelisted device(s).")
 
-                migrated = 0
-                for mac, meta in list(whitelist.items()):
-                    if isinstance(meta, dict) and "ip" in meta and "ips" not in meta:
-                        ip = meta["ip"]
-                        meta["ips"] = []
-                        if ip and ip != "unknown":
-                            meta["ips"].append(ip)
-                        del meta["ip"]
-                        migrated += 1
+            # MIGRATE LEGACY FORMAT IF NEEDED
+            migrated = 0
+            for mac, meta in list(whitelist.items()):
+                if isinstance(meta, dict) and "ip" in meta and "ips" not in meta:
+                    ip = meta["ip"]
+                    meta["ips"] = []
+                    if ip and ip != "unknown":
+                        meta["ips"].append(ip)
+                    del meta["ip"]
+                    migrated += 1
 
-                if migrated:
-                    print(f"[INFO] Migrated {migrated} legacy whitelist entrie(s) to new schema.")
+            if migrated:
+                print(f"[INFO] Migrated {migrated} legacy whitelist entrie(s) to new schema.")
 
-            except json.JSONDecodeError:
-                print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
-                whitelist = {}
-            except Exception as e:
-                print(f"[ERROR] Could not load initial whitelist: {e}. Starting with an empty whitelist.")
-                whitelist = {}
+        except json.JSONDecodeError:
+            print(f"[WARNING] Could not decode existing {WHITELIST_FILE}. Starting with an empty whitelist.")
+            whitelist = {}
+        except Exception as e:
+            print(f"[ERROR] Could not load initial whitelist: {e}. Starting with an empty whitelist.")
+            whitelist = {}
             
     setup_mode()
 
