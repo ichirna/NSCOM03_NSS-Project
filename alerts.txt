@@ -1,0 +1,2 @@
+[ALERT - UNKNOWN DEVICE] New MAC detected: ac:17:c8:10:bc:8e (10.128.128.128) at 2025-11-14 15:25:44
+[ALERT - UNKNOWN DEVICE] New MAC detected: ac:17:c8:10:bc:8e (10.128.128.128) at 2025-11-14 15:25:44

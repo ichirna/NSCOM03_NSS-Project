@@ -27,7 +27,7 @@ MAC Address Anomaly Detector
 SETUP_DURATION = 60
 
 # File paths for persistent data/logs
-WHITELIST_FILE = "whitelist.json"
+WHITELIST_FILE = "allowlist.json"
 ALERT_LOG_FILE = "alerts.txt"
 OBSERVED_PACKET_LOG_FILE = "network_activity.csv"
 
